@@ -35,6 +35,8 @@ const int EVENING_END = 19;
 BH1750 lightMeter;
 WiFiMulti wifiMulti;
 WiFiClient espClient;
+unsigned long lastReconnectAttempt = 0;
+
 PubSubClient client(espClient);
 Ticker blinker;
 TFT_eSPI tft = TFT_eSPI();
@@ -56,6 +58,8 @@ bool isValveManual = false;
 bool isLightManual = false;
 
 bool isSceneShown = false;
+
+
 
 // --------------------- WiFi Setting --------------------------------
 const char* ssid_1 = "@JumboPlusIoT";
@@ -79,6 +83,18 @@ const char* topic_soil = "group8/soil";
 const char* topic_valve = "group8/valve/main";
 
 unsigned long lastScreenUpdate = 0;
+
+// ----------------------- Relay Control Function -----------------
+void setRelayState(int pin, bool active){
+  if(active){
+    // Active LOW สั่งเปิด
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+  }else{
+    // Active HIGH สั่งปิด
+    digitalWrite(pin, INPUT);
+  }
+}
 
 // ------------------ UI --------------------------------------------
 void drawScene_Main() {
@@ -189,78 +205,6 @@ void updateDisplay_Dynamic(int h, int m){
   tft.drawString(timeStr, 235, 235, 2); // มุมขวาล่าง
 }
 
-// void drawUI_Static(){
-//   tft.fillScreen(TFT_BLACK);
-  
-//   // Header
-//   tft.fillRect(0, 0, 240, 30, TFT_NAVY);
-//   tft.setTextDatum(MC_DATUM); // จัดกึ่งกลาง
-//   tft.setTextColor(TFT_WHITE, TFT_NAVY);
-//   tft.drawString("SMART FARM AI", 120, 15, 4); // Font 4
-
-//   // Grid Lines
-//   tft.drawLine(0, 130, 240, 130, TFT_DARKGREY);
-//   tft.drawLine(120, 30, 120, 240, TFT_DARKGREY);
-
-//   // Labels
-//   tft.setTextDatum(TL_DATUM); // จัดชิดซ้าย
-//   tft.setTextColor(TFT_SILVER, TFT_BLACK);
-//   tft.drawString("DLI (Light)", 10, 40, 2);
-//   tft.drawString("SOIL (%)", 130, 40, 2);
-//   tft.drawString("VALVE", 10, 140, 2);
-//   tft.drawString("LIGHT", 130, 140, 2);
-// }
-
-// void updateDisplay(int h, int m) {
-//   // 1. Update DLI
-//   tft.setTextDatum(MC_DATUM);
-//   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-//   tft.drawFloat(current_DLI, 2, 60, 80, 6); // Font 6 (ใหญ่)
-
-//   // 2. Update Soil
-//   if(soilPercent < SOIL_MIN) tft.setTextColor(TFT_RED, TFT_BLACK);
-//   else if(soilPercent > SOIL_MAX) tft.setTextColor(TFT_BLUE, TFT_BLACK);
-//   else tft.setTextColor(TFT_GREEN, TFT_BLACK);
-//   tft.drawNumber(soilPercent, 180, 80, 6);
-
-//   // 3. Update Valve Status
-//   tft.setTextDatum(MC_DATUM);
-//   if(isValveMainOn) {
-//     tft.fillCircle(60, 190, 25, TFT_BLUE);
-//     tft.setTextColor(TFT_WHITE, TFT_BLUE);
-//     tft.drawString("ON", 60, 190, 4);
-//   } else {
-//     tft.fillCircle(60, 190, 25, TFT_DARKGREY);
-//     tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-//     tft.drawString("OFF", 60, 190, 4);
-//   }
-//   // Mode Valve
-//   tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-//   tft.drawString(isValveManual ? "MANUAL" : "AUTO", 60, 225, 2);
-
-//   // 4. Update Light Status
-//   if(isLightOn) {
-//     tft.fillCircle(180, 190, 25, TFT_YELLOW);
-//     tft.setTextColor(TFT_BLACK, TFT_YELLOW);
-//     tft.drawString("ON", 180, 190, 4);
-//   } else {
-//     tft.fillCircle(180, 190, 25, TFT_DARKGREY);
-//     tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-//     tft.drawString("OFF", 180, 190, 4);
-//   }
-//   // Mode Light
-//   tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-//   tft.drawString(isLightManual ? "MANUAL" : "AUTO", 180, 225, 2);
-
-//   // 5. Time Bar (Bottom)
-//   /* แสดงเวลาเล็กๆ มุมจอ หรือสถานะ WiFi */
-//   tft.setTextDatum(TR_DATUM); // ชิดขวาบน
-//   tft.setTextColor(TFT_CYAN, TFT_NAVY);
-//   char timeStr[10];
-//   sprintf(timeStr, "%02d:%02d", h, m);
-//   tft.drawString(timeStr, 235, 5, 2);
-// }
-
 // --------------------- Callback Function ------------------------------
 void callback(char* topic, byte* payload, unsigned int length){
   Serial.print("Message [");
@@ -286,7 +230,7 @@ void callback(char* topic, byte* payload, unsigned int length){
     // Action Control ทำงานตอนอยู๋ในโหมด Manual เท่านั้น
     else if(msg == "VALVE_ON"){
       if(isValveManual){
-        digitalWrite(RELAY_VALVE_MAIN, LOW);
+        setRelayState(RELAY_VALVE_MAIN, true);
         isValveMainOn = true;
         Serial.println("MANUAL: VALVE ON"); 
       }else{
@@ -294,7 +238,7 @@ void callback(char* topic, byte* payload, unsigned int length){
       }
     }else if(msg == "VALVE_OFF"){
       if(isValveManual){
-        digitalWrite(RELAY_VALVE_MAIN, HIGH);
+        setRelayState(RELAY_VALVE_MAIN, false);
         isValveMainOn = false;
         Serial.println("MANUAL: VALVE OFF");
       }else{
@@ -312,7 +256,7 @@ void callback(char* topic, byte* payload, unsigned int length){
     // Action Control ทำงานได้เฉพาะอยู่ในโหมด manual เท่านั้น
     else if(msg == "LIGHT_ON"){
       if(isLightManual){
-        digitalWrite(RELAY_LIGHT, LOW);
+        setRelayState(RELAY_LIGHT, true);
         isLightOn = true;
         Serial.println("MANUAL: LIGHT ON");
       }else{
@@ -321,7 +265,7 @@ void callback(char* topic, byte* payload, unsigned int length){
       
     }else if(msg == "LIGHT_OFF"){
       if(isLightManual){
-        digitalWrite(RELAY_LIGHT, HIGH);
+        setRelayState(RELAY_LIGHT, false);
         isLightOn = false;
         Serial.println("MANUAL: LIGHT OFF");
       }else{
@@ -445,15 +389,15 @@ void calculate(int currentHour){
   }
   else {
     if(currentHour >= 6 && currentHour < 18){
-      digitalWrite(RELAY_LIGHT,HIGH);
+      setRelayState(RELAY_LIGHT, false);
     }else if(currentHour >= 18 && currentHour < 24){
       if(current_DLI < target_DLI){
-        digitalWrite(RELAY_LIGHT, LOW); // เปิดไฟ
+        setRelayState(RELAY_LIGHT, true); // เปิดไฟ
       }else{
-        digitalWrite(RELAY_LIGHT, HIGH); 
+        setRelayState(RELAY_LIGHT, false);
       }
     }else{
-      digitalWrite(RELAY_LIGHT, HIGH);
+      setRelayState(RELAY_LIGHT, false);
     }
     // ถ้าเป็นตอนเที่ยงคืนให้ Reset ค่า DLI
     if(currentHour == 0 && current_DLI > 1.0){ // >1.0 เพื่อกัน Reset รัวๆ
@@ -469,7 +413,7 @@ void calculate(int currentHour){
     bool isEvening = (currentHour >= EVENING_START && currentHour < EVENING_END);
     // ถ้าไม่ได้อยู่ในช่วงเช้าและเย็น
     if(!isMorning && !isEvening){
-      digitalWrite(RELAY_VALVE_MAIN, HIGH);
+      setRelayState(RELAY_VALVE_MAIN, false);
       isValveMainOn = false;
       isMorningDone = false;
       isEveningDone = false;
@@ -481,20 +425,20 @@ void calculate(int currentHour){
       if(!(*currentDoneFlag) && lux < LUX_SAFE_LIMIT){
         // ถ้าดินชุ่มถึงเป้าหมายแล้ว (80%) -> จบงานทันที
         if (soilPercent >= SOIL_MAX) {
-          digitalWrite(RELAY_VALVE_MAIN, HIGH); // ปิดวาล์ว
+          setRelayState(RELAY_VALVE_MAIN, false); // ปิดวาล์ว
           isValveMainOn = false;
           *currentDoneFlag = true; // ระบบจะไม่รดน้ำอีกต่อไปจนกว่าจะเปลี่ยนรอบ
         }
         // ถ้าดินแห้งต่ำว่า 40% -> เติมน้ำ
         else if(soilPercent <= SOIL_MIN){
-          digitalWrite(RELAY_VALVE_MAIN, LOW);
+          setRelayState(RELAY_VALVE_MAIN, true);
           isValveMainOn = true;
         }
         // ระบบนี้จะทำงานอยู่ในช่วง 41% - 79%
       }
       // รดน้ำเสร็จแล้ว หรือแดดแรงเกิน -> ปิดวาล์ว
       else{
-        digitalWrite(RELAY_VALVE_MAIN, HIGH);
+        setRelayState(RELAY_VALVE_MAIN, false);
         isValveMainOn = false;
       }
     }
@@ -541,11 +485,8 @@ void setup() {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("BOOTING SYSTEM...", 10, 10, 4);
 
-  pinMode(RELAY_LIGHT, OUTPUT);  
-  digitalWrite(RELAY_LIGHT, HIGH); 
-
-  pinMode(RELAY_VALVE_MAIN, OUTPUT);
-  digitalWrite(RELAY_VALVE_MAIN, HIGH);
+  setRelayState(RELAY_LIGHT, false);
+  setRelayState(RELAY_VALVE_MAIN, false);
     
   pinMode(SOIL_PIN, INPUT);
   
@@ -569,21 +510,22 @@ void loop() {
   }
   client.loop();
 
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    Serial.println("Failed to show time");
-    return;
-  }
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-
-  int currentHour = timeinfo.tm_hour;
-  int currentMin = timeinfo.tm_min;
-  
-  // เรียกฟังก์ชันคำนวณ (ไม่งั้น DLI ไม่ขยับ)
-  calculate(currentHour);
-
   if(millis() - lastScreenUpdate > 1000){
-    updateDisplay_Dynamic(currentHour, currentMin);
     lastScreenUpdate = millis();
+
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)){
+      Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+      int currentHour = timeinfo.tm_hour;
+      int currentMin = timeinfo.tm_min;
+
+      // เรียกฟังก์ชันคำนวณ (ไม่งั้น DLI ไม่ขยับ)
+      calculate(currentHour);
+      updateDisplay_Dynamic(currentHour, currentMin);
+    }
+    if(!getLocalTime(&timeinfo)){
+      Serial.println("Failed to show time");
+      return;
+    }
   }
 }
