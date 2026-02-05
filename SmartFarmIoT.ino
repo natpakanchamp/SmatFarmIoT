@@ -5,6 +5,8 @@
 #include <PubSubClient.h>
 #include <time.h>
 #include <Ticker.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
 
 #define RELAY_LIGHT 4 // แก้ขา Pin ตามที่ใช้งานจริง
 #define SOIL_PIN 34  // ขาอ่านค่าความชื้นดิน (ADC1 Only)
@@ -33,8 +35,11 @@ const int EVENING_END = 19;
 BH1750 lightMeter;
 WiFiMulti wifiMulti;
 WiFiClient espClient;
+unsigned long lastReconnectAttempt = 0;
+
 PubSubClient client(espClient);
 Ticker blinker;
+TFT_eSPI tft = TFT_eSPI();
 
 // Variables
 float SUN_FACTOR = 0.0185; 
@@ -51,6 +56,10 @@ bool isEveningDone = false;
 // [Manual Modes] แยกกันอิสระ
 bool isValveManual = false; 
 bool isLightManual = false;
+
+bool isSceneShown = false;
+
+
 
 // --------------------- WiFi Setting --------------------------------
 const char* ssid_1 = "@JumboPlusIoT";
@@ -72,6 +81,129 @@ const char* topic_status = "group8/status";
 const char* topic_dli = "group8/dli";
 const char* topic_soil = "group8/soil";
 const char* topic_valve = "group8/valve/main";
+
+unsigned long lastScreenUpdate = 0;
+
+// ----------------------- Relay Control Function -----------------
+void setRelayState(int pin, bool active){
+  if(active){
+    // Active LOW สั่งเปิด
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+  }else{
+    // Active HIGH สั่งปิด
+    digitalWrite(pin, INPUT);
+  }
+}
+
+// ------------------ UI --------------------------------------------
+void drawScene_Main() {
+  tft.fillScreen(TFT_BLACK); // ล้างจอ
+  isSceneShown = true;
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK); // สีขาว พื้นดำ
+  tft.setTextSize(3);
+  // tft.setFreeFont(); // (ถ้าเจ้านายไม่ได้โหลดฟอนต์แยก แนะนำให้ปิดบรรทัดนี้แล้วใช้ฟอนต์มาตรฐานจะง่ายกว่าครับ)
+
+  // --- หัวข้อและหน่วย ---
+  tft.drawString("Soil", 10, 10);
+  tft.drawString("%", 215, 10);
+  
+  tft.drawString("Lux", 10, 40);
+  // ตรง Lux อาจจะไม่มีหน่วย % หรือเปล่าครับ? อาจจะเป็นค่าดิบ หรือ DLI
+  // tft.drawString("%", 215, 40); 
+
+  tft.drawLine(10, 71, 229, 71, TFT_WHITE); // เส้นคั่นกลาง
+
+  // --- โซนสถานะ (วงกลมเปล่าๆ) ---
+  // Valve & Light Labels
+  tft.setTextSize(2); // ลดขนาดฟอนต์หน่อย
+  tft.drawString("VALVE", 49, 85);
+  tft.drawString("LIGHT", 164, 85);
+
+  // Auto/Manual Circles (วาดโครงไว้ก่อน)
+  tft.drawEllipse(62, 122, 25, 25, TFT_WHITE);
+  tft.drawEllipse(177, 122, 25, 25, TFT_WHITE);
+  
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM); // จัดกึ่งกลางข้อความ
+  tft.drawString("MODE", 62, 122);  // เขียนกำกับไว้ตรงกลาง
+  tft.drawString("MODE", 177, 122);
+
+  // ON/OFF Circles (วาดโครงไว้ก่อน)
+  tft.drawEllipse(34, 184, 25, 25, TFT_WHITE);   // Valve ON
+  tft.drawEllipse(91, 184, 25, 25, TFT_WHITE);   // Valve OFF
+  tft.drawEllipse(148, 184, 25, 25, TFT_WHITE);  // Light ON
+  tft.drawEllipse(205, 184, 25, 25, TFT_WHITE);  // Light OFF
+
+  // Label ON/OFF เล็กๆ
+  tft.drawString("ON", 34, 160);
+  tft.drawString("OFF", 91, 160);
+  tft.drawString("ON", 148, 160);
+  tft.drawString("OFF", 205, 160);
+}
+
+void updateDisplay_Dynamic(int h, int m){
+  tft.setTextSize(3);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK); // สีเหลือง พื้นดำ (กันกระพริบ)
+  tft.setTextDatum(TR_DATUM);
+
+  tft.drawNumber(soilPercent, 200, 10); // แสดงค่า Soil ที่พิกัด x=200
+  tft.drawFloat(current_DLI, 2, 200, 40); // แสดงค่า Lux/DLI
+
+  // --- 2. อัปเดตสถานะ VALVE (วงกลมสี) ---
+  // โหมด Auto/Manual
+  if(isValveManual) {
+     tft.fillEllipse(62, 122, 23, 23, TFT_ORANGE); // Manual = สีส้ม
+     tft.setTextColor(TFT_BLACK, TFT_ORANGE);
+     tft.setTextDatum(MC_DATUM);
+     tft.drawString("MAN", 62, 122, 2); 
+  } else {
+     tft.fillEllipse(62, 122, 23, 23, TFT_CYAN); // Auto = สีฟ้า
+     tft.setTextColor(TFT_BLACK, TFT_CYAN);
+     tft.setTextDatum(MC_DATUM);
+     tft.drawString("AUTO", 62, 122, 2);
+  }
+
+  // สถานะ ON/OFF (Valve)
+  if(isValveMainOn) {
+    tft.fillEllipse(34, 184, 20, 20, TFT_GREEN); // ปุ่ม ON ติดเขียว
+    tft.fillEllipse(91, 184, 20, 20, TFT_BLACK); // ปุ่ม OFF ดับ
+  } else {
+    tft.fillEllipse(34, 184, 20, 20, TFT_BLACK); // ปุ่ม ON ดับ
+    tft.fillEllipse(91, 184, 20, 20, TFT_RED);   // ปุ่ม OFF ติดแดง
+  }
+
+  // --- 3. อัปเดตสถานะ LIGHT (วงกลมสี) ---
+  // โหมด Auto/Manual
+  if(isLightManual) {
+     tft.fillEllipse(177, 122, 23, 23, TFT_ORANGE);
+     tft.setTextColor(TFT_BLACK, TFT_ORANGE);
+     tft.drawString("MAN", 177, 122, 2);
+  } else {
+     tft.fillEllipse(177, 122, 23, 23, TFT_CYAN);
+     tft.setTextColor(TFT_BLACK, TFT_CYAN);
+     tft.drawString("AUTO", 177, 122, 2);
+  }
+
+  // สถานะ ON/OFF (Light)
+  if(isLightOn) {
+    tft.fillEllipse(148, 184, 20, 20, TFT_GREEN);
+    tft.fillEllipse(205, 184, 20, 20, TFT_BLACK);
+  } else {
+    tft.fillEllipse(148, 184, 20, 20, TFT_BLACK);
+    tft.fillEllipse(205, 184, 20, 20, TFT_RED);
+  }
+
+  // ใช้พื้นที่ว่างๆ เขียนเวลาปัจจุบัน
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextDatum(BR_DATUM); // ชิดขวาล่างสุด
+  
+  char timeStr[10];
+  sprintf(timeStr, "%02d:%02d", h, m);
+  tft.drawString(timeStr, 235, 235, 2); // มุมขวาล่าง
+}
 
 // --------------------- Callback Function ------------------------------
 void callback(char* topic, byte* payload, unsigned int length){
@@ -98,7 +230,7 @@ void callback(char* topic, byte* payload, unsigned int length){
     // Action Control ทำงานตอนอยู๋ในโหมด Manual เท่านั้น
     else if(msg == "VALVE_ON"){
       if(isValveManual){
-        digitalWrite(RELAY_VALVE_MAIN, LOW);
+        setRelayState(RELAY_VALVE_MAIN, true);
         isValveMainOn = true;
         Serial.println("MANUAL: VALVE ON"); 
       }else{
@@ -106,7 +238,7 @@ void callback(char* topic, byte* payload, unsigned int length){
       }
     }else if(msg == "VALVE_OFF"){
       if(isValveManual){
-        digitalWrite(RELAY_VALVE_MAIN, HIGH);
+        setRelayState(RELAY_VALVE_MAIN, false);
         isValveMainOn = false;
         Serial.println("MANUAL: VALVE OFF");
       }else{
@@ -124,7 +256,7 @@ void callback(char* topic, byte* payload, unsigned int length){
     // Action Control ทำงานได้เฉพาะอยู่ในโหมด manual เท่านั้น
     else if(msg == "LIGHT_ON"){
       if(isLightManual){
-        digitalWrite(RELAY_LIGHT, LOW);
+        setRelayState(RELAY_LIGHT, true);
         isLightOn = true;
         Serial.println("MANUAL: LIGHT ON");
       }else{
@@ -133,7 +265,7 @@ void callback(char* topic, byte* payload, unsigned int length){
       
     }else if(msg == "LIGHT_OFF"){
       if(isLightManual){
-        digitalWrite(RELAY_LIGHT, HIGH);
+        setRelayState(RELAY_LIGHT, false);
         isLightOn = false;
         Serial.println("MANUAL: LIGHT OFF");
       }else{
@@ -168,9 +300,32 @@ void timezoneSync(){
 
 // --------------------- Connection ---------------------------------
 void connect(){
-  wifiMulti.addAP(ssid_1, pass_1);
-  wifiMulti.addAP(ssid_2, pass_2);
-  wifiMulti.addAP(ssid_3, pass_3);
+  if(wifiMulti.run() == WL_CONNECTED){
+    client.setServer(mqtt_broker, mqtt_port);
+    client.setCallback(callback);
+
+    if(client.connected()){
+      return;
+    }
+
+    if(client.connect(mqtt_client_id)){
+      Serial.println("\nMQTT Reconnected (Silent)!");
+      client.subscribe(mqtt_topic_cmd);
+      client.publish(topic_status, "SYSTEM READY");
+
+      if(!isSceneShown) drawScene_Main();
+      return;
+    }else{
+      Serial.println("MQTT Failed... Retrying silently");
+      delay(1000); 
+      return;
+    }
+  }
+  // ระหว่างรอ WiFi ให้ขึ้นจอหน่อย
+  isSceneShown = false;
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Connecting...", 120, 120, 4);
 
   blinker.attach(0.5, tick);
 
@@ -200,6 +355,9 @@ void connect(){
     }
   }
   blinker.detach();
+
+  // พอต่อติดแล้ว ให้วาด UI หลักรอไว้เลย
+  drawScene_Main();
 }
 
 // --------------------- คำนวณระบบ DLI & SOIL -------------------------------
@@ -231,15 +389,15 @@ void calculate(int currentHour){
   }
   else {
     if(currentHour >= 6 && currentHour < 18){
-      digitalWrite(RELAY_LIGHT,HIGH);
+      setRelayState(RELAY_LIGHT, false);
     }else if(currentHour >= 18 && currentHour < 24){
       if(current_DLI < target_DLI){
-        digitalWrite(RELAY_LIGHT, LOW); // เปิดไฟ
+        setRelayState(RELAY_LIGHT, true); // เปิดไฟ
       }else{
-        digitalWrite(RELAY_LIGHT, HIGH); 
+        setRelayState(RELAY_LIGHT, false);
       }
     }else{
-      digitalWrite(RELAY_LIGHT, HIGH);
+      setRelayState(RELAY_LIGHT, false);
     }
     // ถ้าเป็นตอนเที่ยงคืนให้ Reset ค่า DLI
     if(currentHour == 0 && current_DLI > 1.0){ // >1.0 เพื่อกัน Reset รัวๆ
@@ -255,7 +413,7 @@ void calculate(int currentHour){
     bool isEvening = (currentHour >= EVENING_START && currentHour < EVENING_END);
     // ถ้าไม่ได้อยู่ในช่วงเช้าและเย็น
     if(!isMorning && !isEvening){
-      digitalWrite(RELAY_VALVE_MAIN, HIGH);
+      setRelayState(RELAY_VALVE_MAIN, false);
       isValveMainOn = false;
       isMorningDone = false;
       isEveningDone = false;
@@ -267,20 +425,20 @@ void calculate(int currentHour){
       if(!(*currentDoneFlag) && lux < LUX_SAFE_LIMIT){
         // ถ้าดินชุ่มถึงเป้าหมายแล้ว (80%) -> จบงานทันที
         if (soilPercent >= SOIL_MAX) {
-          digitalWrite(RELAY_VALVE_MAIN, HIGH); // ปิดวาล์ว
+          setRelayState(RELAY_VALVE_MAIN, false); // ปิดวาล์ว
           isValveMainOn = false;
           *currentDoneFlag = true; // ระบบจะไม่รดน้ำอีกต่อไปจนกว่าจะเปลี่ยนรอบ
         }
         // ถ้าดินแห้งต่ำว่า 40% -> เติมน้ำ
         else if(soilPercent <= SOIL_MIN){
-          digitalWrite(RELAY_VALVE_MAIN, LOW);
+          setRelayState(RELAY_VALVE_MAIN, true);
           isValveMainOn = true;
         }
         // ระบบนี้จะทำงานอยู่ในช่วง 41% - 79%
       }
       // รดน้ำเสร็จแล้ว หรือแดดแรงเกิน -> ปิดวาล์ว
       else{
-        digitalWrite(RELAY_VALVE_MAIN, HIGH);
+        setRelayState(RELAY_VALVE_MAIN, false);
         isValveMainOn = false;
       }
     }
@@ -316,11 +474,19 @@ void setup() {
   Serial.println("--- System Starting ---");
   Wire.begin(SDA, SCL);
 
-  pinMode(RELAY_LIGHT, OUTPUT);  
-  digitalWrite(RELAY_LIGHT, HIGH); 
+  tft.init();
+  tft.setRotation(1);
 
-  pinMode(RELAY_VALVE_MAIN, OUTPUT);
-  digitalWrite(RELAY_VALVE_MAIN, HIGH);
+  wifiMulti.addAP(ssid_1, pass_1);
+  wifiMulti.addAP(ssid_2, pass_2);
+  wifiMulti.addAP(ssid_3, pass_3);
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("BOOTING SYSTEM...", 10, 10, 4);
+
+  setRelayState(RELAY_LIGHT, false);
+  setRelayState(RELAY_VALVE_MAIN, false);
     
   pinMode(SOIL_PIN, INPUT);
   
@@ -344,17 +510,22 @@ void loop() {
   }
   client.loop();
 
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    Serial.println("Failed to show time");
-    return;
+  if(millis() - lastScreenUpdate > 1000){
+    lastScreenUpdate = millis();
+
+    struct tm timeinfo;
+    if(getLocalTime(&timeinfo)){
+      Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+      int currentHour = timeinfo.tm_hour;
+      int currentMin = timeinfo.tm_min;
+
+      // เรียกฟังก์ชันคำนวณ (ไม่งั้น DLI ไม่ขยับ)
+      calculate(currentHour);
+      updateDisplay_Dynamic(currentHour, currentMin);
+    }
+    if(!getLocalTime(&timeinfo)){
+      Serial.println("Failed to show time");
+      return;
+    }
   }
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-
-  int currentHour = timeinfo.tm_hour;
-  
-  // เรียกฟังก์ชันคำนวณ (ไม่งั้น DLI ไม่ขยับ)
-  calculate(currentHour);
-
-  delay(1000);
 }
