@@ -64,6 +64,10 @@ bool isSceneShown = false;
 
 unsigned long lastNetworkCheck = 0; // สำหรับเช็คเน็ตโดยไม่บล๊อกการทำงานหลัก
 unsigned long lastCalcUpdate = 0; // สำหรับคำนวณ DLI และรดน้ำ
+unsigned long lastDliMillis = 0;
+int lastResetDayKey = -1;
+unsigned long lastTimeResyncAttempt = 0;
+unsigned long lastTelemetry = 0;
 
 bool isTimeSynced = false;
 
@@ -101,7 +105,6 @@ void setRelayState(int pin, bool active){
     digitalWrite(pin, LOW);
   }else{
     // Active HIGH สั่งปิด
-    pinMode(pin, OUTPUT);
     digitalWrite(pin, HIGH);
   }
 }
@@ -315,7 +318,7 @@ void timezoneSync(){
     Serial.println("\nTime Synced!");
     isTimeSynced = true;
   }else{
-    Serial.println("\n")
+    Serial.println("\n");
   }
   
 }
@@ -415,35 +418,96 @@ void handleNetwork(){
         Serial.println(" (will try again in 5s)");
       }
     }
+    if(wifiMulti.run() == WL_CONNECTED && !isTimeSynced){
+      if(millis() - lastTimeResyncAttempt > 60000UL){
+        lastTimeResyncAttempt = millis();
+        timezoneSync();
+      }
+    }
   }
+}
+
+void handleDailyReset(struct tm timeinfo){
+  int dayKey = timeinfo.tm_yday;
+  if(dayKey != lastResetDayKey){
+    lastResetDayKey = dayKey;
+
+    current_DLI = 0.0;
+    isMorningDone = false;
+    isEveningDone = false;
+
+    Serial.println("[Daily Reset] : Reset DLI and done-flag");
+  }
+}
+
+void reportTelemetry(float lux){
+  if(!client.connected()) return;
+  
+  char msg[50];
+  sprintf(msg, "%.2f", current_DLI);
+  client.publish(topic_dli, msg);
+  
+  sprintf(msg, "%d", soilPercent);
+  client.publish(topic_soil, msg);
+
+  String statusMsg = "V:" + String(isValveManual ? "MAN" : "AUTO") + " | L:" + String(isLightManual ? "MAN" : "AUTO");
+  client.publish(topic_status, statusMsg.c_str());
+
+  // LUX
+  sprintf(msg, "%.2f", lux);
+  client.publish(topic_lux, msg);
+  
+  Serial.println("[MQTT] Telemetry Sent >>");
 }
 
 // --------------------- คำนวณระบบ DLI & SOIL -------------------------------
 void calculate(int currentHour, int currentMin){
   // LIGHT SYSTEM
   float lux = lightMeter.readLightLevel();
-  float factor_used;
 
-  if(digitalRead(RELAY_LIGHT) == LOW){
-    factor_used = LIGHT_FACTOR;
-    isLightOn = true;
-  }else{
-    factor_used = SUN_FACTOR;
-    isLightOn = false;
+  // --------------- Light Control -------------------------
+  if(isLightManual){
+    isLightOn = (digitalRead(RELAY_LIGHT) == LOW);
+  }
+  else {
+    bool wantLightOn = false;
+    // เปิดไฟเฉพาะช่วง 18:00 - 23:59 และ DLI ยังไม่ถึงเป้า
+    if(currentHour >= 18 && currentHour <= 23){
+       if(current_DLI < target_DLI){
+         wantLightOn = true;
+       }
+    }
+    
+    // สั่ง Relay (ตรวจสอบสถานะก่อนสั่งเพื่อลด Overhead)
+    if(isLightOn != wantLightOn){
+        setRelayState(RELAY_LIGHT, wantLightOn);
+        isLightOn = wantLightOn;
+    }
   }
 
+  // ---------- DLI time Integration --------------
+  unsigned long nowMs = millis();
+  if(lastDliMillis == 0) lastDliMillis = nowMs;
+  float dtSeconds = (nowMs - lastDliMillis) / 1000.0f;
+  lastDliMillis = nowMs;
+  // ป้องกันไม่ให้ dt มากผิดปกติ ไม่งั้น DLI ค่าจะกระโด
+  if(dtSeconds < 0) dtSeconds = 0;
+  if(dtSeconds > 5.0f) dtSeconds = 5.0f;
+
+  float factor_used = isLightOn ? LIGHT_FACTOR : SUN_FACTOR;
   float ppfd = lux * factor_used;
-  current_DLI += (ppfd * 1.0) / 1000000.0;
+
+  current_DLI += (ppfd * dtSeconds) / 1000000.0f;
   Serial.print("Current DLI: ");
   Serial.println(current_DLI);
 
-  // อ่านค่าความชื้นดิน
+  // -------------- Soil Moisture --------------------------
   int rawSoil = analogRead(SOIL_PIN);
   soilPercent = map(rawSoil, AIR_VALUE, WATER_VALUE, 0, 100);
   soilPercent = constrain(soilPercent, 0, 100); // 0 - 100 %
 
+  // --------------- Time windows --------------------------
   int currentTimeMins = (currentHour * 60) + currentMin;
-
   // กำหนดช่วงเวลา (แปลงเป็นนาที)
   // ตัวอย่าง: ถ้า MORNING_START = 6 คือ 6*60 = 360 นาที (06:00)
   int morningStartMins = MORNING_START * 60; 
@@ -451,28 +515,7 @@ void calculate(int currentHour, int currentMin){
   int eveningStartMins = EVENING_START * 60;
   int eveningEndMins   = EVENING_END * 60;
 
-  // Light Control
-  if(isLightManual){
-    isLightOn = (digitalRead(RELAY_LIGHT) == LOW);
-  }
-  else {
-    if(currentHour >= 6 && currentHour < 18){
-      setRelayState(RELAY_LIGHT, false);
-    }else if(currentHour >= 18 && currentHour < 24){
-      if(current_DLI < target_DLI){
-        setRelayState(RELAY_LIGHT, true); // เปิดไฟ
-      }else{
-        setRelayState(RELAY_LIGHT, false);
-      }
-    }else{
-      setRelayState(RELAY_LIGHT, false);
-    }
-    // ถ้าเป็นตอนเที่ยงคืนให้ Reset ค่า DLI
-    if(currentHour == 0){
-      current_DLI = 0; 
-    }
-  }
-
+  // ----------------- Valve Control -----------------
   if(isValveManual){
     isValveMainOn = (digitalRead(RELAY_VALVE_MAIN) == LOW);
   }else{
@@ -483,8 +526,6 @@ void calculate(int currentHour, int currentMin){
     if(!isMorning && !isEvening){
       setRelayState(RELAY_VALVE_MAIN, false);
       isValveMainOn = false;
-      if(currentTimeMins > morningEndMins) isMorningDone = false;
-      if(currentTimeMins > eveningEndMins || currentTimeMins == 0) isEveningDone = false;
     }
     // ถ้าอยู่ในช่วงเช้าและเย็น
     else{
@@ -512,7 +553,7 @@ void calculate(int currentHour, int currentMin){
     }
   }
 
-  // Debug Monitor
+  // ------------------------ Debug Monitor ------------------------
   Serial.println("--- Status ---");
   Serial.print(" | Lux: "); Serial.println(lux);
   Serial.print(" | DLI: "); Serial.println(current_DLI);
@@ -523,22 +564,6 @@ void calculate(int currentHour, int currentMin){
   Serial.print(" | Valve: "); Serial.println(isValveMainOn ? "ON" : "OFF");
   Serial.print(" | M-Done: "); Serial.println(isMorningDone);
   Serial.print(" | E-Done: "); Serial.println(isEveningDone);
-
-
-
-  char msg[50];
-  // ส่งค่า DLI (ปริมาณแสงตลอดทั้งวัน)
-  sprintf(msg, "%.2f", current_DLI);
-  client.publish(topic_dli, msg);
-  // ส่งค่า SOIL (ค่าความชื้น)
-  sprintf(msg, "%d", soilPercent);
-  client.publish(topic_soil, msg);
-
-  String statusMsg = "V:" + String(isValveManual ? "MANUAL" : "AUTO") + " | L:" + String(isLightManual ? "MANUAL" : "AUTO");
-  client.publish(topic_status, statusMsg.c_str());
-
-  sprintf(msg, "%.2f", lux);
-  client.publish(topic_lux, msg);
 }
 
 void setup() {
@@ -560,6 +585,9 @@ void setup() {
     Serial.print(F("Error initialising BH1750!!"));
   }
 
+  // Connect Network
+  // ตั้งค่า Time Server ไว้รอ (มันจะ sync เองใน background เมื่อเน็ตมา)
+  configTime(25200, 0, "pool.ntp.org"); // UTC+7 = 25200 sec
   wifiMulti.addAP(ssid_1, pass_1);
   wifiMulti.addAP(ssid_2, pass_2);
   wifiMulti.addAP(ssid_3, pass_3);
@@ -572,7 +600,7 @@ void setup() {
   Serial.println("System Ready: All Relays OFF");
   delay(1000);
 
-  unsign long startAttempt = millis();
+  unsigned long startAttempt = millis();
   bool wifiConnected = false;
 
   while(millis() - startAttempt < 15000){ // วนรับสัญญาณเน็ต 15 วิ
@@ -587,17 +615,14 @@ void setup() {
   if(wifiConnected){
     Serial.println("\nWiFi Connected!");
     tft.fillScreen(TFT_BLACK);
-    tft.drawString("SNSING TIME...", 10, 10, 4);
-    timezoneSync() // ดึงเวลาจาก Server
+    tft.drawString("SENSING TIME...", 10, 10, 4);
+    timezoneSync(); // ดึงเวลาจาก Server
   }else{
     Serial.println("\nWiFi Failed! Entering OFFLINE Mode.");
-    tft.drawString("Can't sysn time. Offline Mode.");
+    tft.drawString("Can't sync time.", 10, 10, 4); 
+    tft.drawString("Offline Mode.", 10, 40, 4);
     delay(2000);
   }
-
-  // Connect Network
-  // ตั้งค่า Time Server ไว้รอ (มันจะ sync เองใน background เมื่อเน็ตมา)
-  //configTime(25200, 0, "pool.ntp.org"); // UTC+7 = 25200 sec
 
   drawScene_Main();
   //Serial.println("Setup Done -> Entering Main Loop");
@@ -614,37 +639,29 @@ void loop() {
     lastCalcUpdate = millis();
 
     struct tm timeinfo;
-    if(getLocalTime(&timeinfo, 0)){
-      calculate(timeinfo.tm_hour, timeinfo.tm_min);
-    }else{
-      Serial.println("Time Error: System waits for time sync...");
-
-      // ยังคงให้อ่านค่า Sensor เพื่อส่งขึ้นจอ
-      float lux = lightMeter.readLightLevel();
-      int rawSoil = analogRead(SOIL_PIN);
-      soilPercent = map(rawSoil, AIR_VALUE, WATER_VALUE, 0, 100);
-      soilPercent = constrain(soilPercent, 0, 100);
-      
-      // Manual Mode ยังต้องทำงานได้
-      if(isValveManual) isValveMainOn = (digitalRead(RELAY_VALVE_MAIN) == LOW);
-      if(isLightManual) isLightOn = (digitalRead(RELAY_LIGHT) == LOW);
-    }
-  }
-
-  if(millis() - lastScreenUpdate > 500){ // จออัพเดททุกๆ 0.5 วิ
-    lastScreenUpdate = millis();
-
-    struct tm timeinfo;
     int h = 0;
     int m = 0;
-    
-    // ดึงเวลาอีกครั้งเพื่อแสดงผล
-    if(getLocalTime(&timeinfo, 0)){
+    bool validTime = getLocalTime(&timeinfo, 0);
+    if(validTime){
       h = timeinfo.tm_hour;
       m = timeinfo.tm_min;
-      Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S"); // ปริ้นถ้ารกเกินไปก็ปิดได้ครับ
+      handleDailyReset(timeinfo);
+    }else{
+      Serial.println("Time Error: System waits for time sync...");
+      h = 12;
     }
-    // อัปเดตหน้าจอ
+    calculate(h, m);
     updateDisplay_Dynamic(h, m);
+  }
+
+  // 2. Telemetry (ส่งข้อมูลเข้าเน็ต ทุกๆ 10 วินาที)
+  // -----------------------------------------------------------
+  if(millis() - lastTelemetry > 1000){ // 1000ms = 10 วินาที
+    lastTelemetry = millis();
+
+    // ต้องอ่านค่าแสงตรงนี้เพื่อส่ง (เพราะเราแยกส่วนกันแล้ว)
+    float currentLux = lightMeter.readLightLevel(); 
+    reportTelemetry(currentLux);
+    Serial.println("[MQTT] Telemetry Sent");
   }
 }
