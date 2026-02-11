@@ -2,7 +2,6 @@
 #include <BH1750.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
-#include <PubSubClient.h>
 #include <time.h>
 #include <Ticker.h>
 #include <SPI.h>
@@ -12,6 +11,11 @@
 #include <Preferences.h> // [เพิ่ม] สำหรับบันทึกค่าลง Flash Memory
 #include <RTClib.h>
 #include <AsyncMqttClient.h>
+
+extern "C" {
+  #include "freertos/FreeRTOS.h"
+  #include "freertos/timers.h"
+}
 
 #define RELAY_LIGHT 4 // แก้ขา Pin ตามที่ใช้งานจริง
 #define SOIL_PIN 34  // ขาอ่านค่าความชื้นดิน (ADC1 Only)
@@ -41,8 +45,9 @@ const int EVENING_END = 19;
 // Objects
 BH1750 lightMeter;
 WiFiMulti wifiMulti;
-WiFiClient espClient;
-PubSubClient client(espClient);
+AsyncMqttClient mqttClient;
+TimerHandle_t mqttReconnectTimer; // ตัวจับเวลาสำหรับ Reconnect MQTT
+TimerHandle_t wifiReconnectTimer; // ตัวจับเวลาสำหรับ Reconnect WiFi
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite sprite = TFT_eSprite(&tft); // Sprite แก้จอกระพริบ 
 Preferences preferences; // ตัวจัดการหน่วยความจำถาวร
@@ -369,84 +374,206 @@ void timezoneSync(){
 }
 
 // --------------------- Handle Network -------------------------------------
+// void handleNetwork(){
+//   bool isWifiConnected = (wifiMulti.run() == WL_CONNECTED);
+
+//   // เช็คว่า "เพิ่งจะ" ต่อเน็ตติดหรือไม่? (Transition from Disconnect -> Connect)
+//   if(isWifiConnected && !wasWifiConnected){
+//     Serial.println("[Network] Reconnected! Syncing Time immediately...");
+//     timezoneSync(); // <--- ซิงค์ทันทีเมื่อเน็ตกลับมา!
+//   }
+//   // อัปเดตสถานะล่าสุดเก็บไว้เทียบรอบหน้า
+//   wasWifiConnected = isWifiConnected;
+
+//   // เช็คสถานะ MQTT
+//   if(millis() - lastNetworkCheck > 5000){
+//     lastNetworkCheck = millis();
+
+//     if(wifiMulti.run() != WL_CONNECTED){ Serial.println("WiFi lost... reconnecting"); }
+//     else if(!client.connected()){
+//       Serial.print("Attemting MQTT connection");
+//       String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
+
+//       if (client.connect(clientId.c_str())) {
+//         Serial.println("Connected!");
+//         client.subscribe(mqtt_topic_cmd);
+//         client.publish(topic_status, "SYSTEM RECOVERED");
+//       } else {
+//         Serial.print("failed, rc=");
+//         Serial.print(client.state());
+//         Serial.println(" (will try again in 5s)");
+//       }
+//     }
+//     // Auto Sync
+//     if(wifiMulti.run() == WL_CONNECTED){
+//       if(millis() - lastTimeResyncAttempt > 3600000UL){ // ทุก 1 ชม
+//         lastTimeResyncAttempt = millis();
+//         timezoneSync();
+//       }
+//     }
+//   }
+// }
+
 void handleNetwork(){
-  bool isWifiConnected = (wifiMulti.run() == WL_CONNECTED);
-
-  // เช็คว่า "เพิ่งจะ" ต่อเน็ตติดหรือไม่? (Transition from Disconnect -> Connect)
-  if(isWifiConnected && !wasWifiConnected){
-    Serial.println("[Network] Reconnected! Syncing Time immediately...");
-    timezoneSync(); // <--- ซิงค์ทันทีเมื่อเน็ตกลับมา!
-  }
-  // อัปเดตสถานะล่าสุดเก็บไว้เทียบรอบหน้า
-  wasWifiConnected = isWifiConnected;
-
-  // เช็คสถานะ MQTT
-  if(millis() - lastNetworkCheck > 5000){
-    lastNetworkCheck = millis();
-
-    if(wifiMulti.run() != WL_CONNECTED){ Serial.println("WiFi lost... reconnecting"); }
-    else if(!client.connected()){
-      Serial.print("Attemting MQTT connection");
-      String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
-
-      if (client.connect(clientId.c_str())) {
-        Serial.println("Connected!");
-        client.subscribe(mqtt_topic_cmd);
-        client.publish(topic_status, "SYSTEM RECOVERED");
-      } else {
-        Serial.print("failed, rc=");
-        Serial.print(client.state());
-        Serial.println(" (will try again in 5s)");
-      }
-    }
-    // Auto Sync
-    if(wifiMulti.run() == WL_CONNECTED){
-      if(millis() - lastTimeResyncAttempt > 3600000UL){ // ทุก 1 ชม
-        lastTimeResyncAttempt = millis();
+  // WiFiMulti จัดการตัวเองอยู่แล้ว เราแค่เช็คว่าถ้ามันต่อติด แล้ว MQTT หลุด ก็ให้ต่อ MQTT
+  if(wifiMulti.run() == WL_CONNECTED){
+    if(!wasWifiConnected){
+        Serial.println("[Network] WiFi Connected!");
+        wasWifiConnected = true;
         timezoneSync();
-      }
+        connectToMqtt(); // เชื่อมต่อ MQTT ทันทีที่เน็ตมา
     }
+    // Auto Sync Time
+    if(millis() - lastTimeResyncAttempt > 3600000UL){ 
+      lastTimeResyncAttempt = millis();
+      timezoneSync();
+    }
+  } else {
+    wasWifiConnected = false;
   }
 }
 
 void handleDailyReset(struct tm timeinfo){
   int dayKey = timeinfo.tm_yday;
-  if (lastResetDayKey == -1) {
-     lastResetDayKey = preferences.getInt("savedDay", -1);
-  }
+  if (lastResetDayKey == -1) lastResetDayKey = preferences.getInt("savedDay", -1);
+  
   if(dayKey != lastResetDayKey){
     lastResetDayKey = dayKey;
     preferences.putInt("savedDay", dayKey);
-
     current_DLI = 0.0;
-
-    // รีเซ็ตค่าใน NVS ด้วย
     preferences.putFloat("dli", 0.0);
-
     isMorningDone = false;
     isEveningDone = false;
-
-    // *** ล้างค่าใน Flash Memory ด้วย ***
-    preferences.putFloat("dli", 0.0);
     preferences.putBool("mDone", false);
     preferences.putBool("eDone", false);
-
     Serial.println("[Daily Reset] Cleared DLI");
   }
 }
 
+// ----------------------------- Daily Reset --------------------------
+// void handleDailyReset(struct tm timeinfo){
+//   int dayKey = timeinfo.tm_yday;
+//   if (lastResetDayKey == -1) {
+//      lastResetDayKey = preferences.getInt("savedDay", -1);
+//   }
+//   if(dayKey != lastResetDayKey){
+//     lastResetDayKey = dayKey;
+//     preferences.putInt("savedDay", dayKey);
+
+//     current_DLI = 0.0;
+
+//     // รีเซ็ตค่าใน NVS ด้วย
+//     preferences.putFloat("dli", 0.0);
+
+//     isMorningDone = false;
+//     isEveningDone = false;
+
+//     // *** ล้างค่าใน Flash Memory ด้วย ***
+//     preferences.putFloat("dli", 0.0);
+//     preferences.putBool("mDone", false);
+//     preferences.putBool("eDone", false);
+
+//     Serial.println("[Daily Reset] Cleared DLI");
+//   }
+// }
+
+// ---------------------- Report -----------------------------------------
 void reportTelemetry(float lux){
-  if(!client.connected()) return;
+  if(!mqttClient.connected()) return;
   char msg[50];
-  sprintf(msg, "%.2f", current_DLI);  client.publish(topic_dli, msg);
-  sprintf(msg, "%d", soilPercent);    client.publish(topic_soil, msg);
-  sprintf(msg, "%.2f", lux);          client.publish(topic_lux, msg);
+  sprintf(msg, "%.2f", current_DLI);  mqttClient.publish(topic_dli, 0, false, msg);
+  sprintf(msg, "%d", soilPercent);    mqttClient.publish(topic_soil, 0, false, msg);
+  sprintf(msg, "%.2f", lux);          mqttClient.publish(topic_lux, 0, false, msg);
 
   String statusMsg = "V:" + String(isValveManual ? "MAN" : "AUTO") + " | L:" + String(isLightManual ? "MAN" : "AUTO");
-  client.publish(topic_status, statusMsg.c_str());
+  mqttClient.publish(topic_status, 0, false, statusMsg.c_str());
   
   Serial.println("[MQTT] Telemetry Sent >>");
 }
+
+// --------------------- MQTT Event Handlers --------------------------------
+void connectToMqtt() {
+  Serial.println("Connecting to MQTT...");
+  mqttClient.connect();
+}
+
+void onMqttConnect(bool sessionPresent) {
+  Serial.println("Connected to MQTT.");
+  // Subscribe topics เมื่อเชื่อมต่อติด
+  mqttClient.subscribe(mqtt_topic_cmd, 2); // QoS 2
+  mqttClient.publish(topic_status, 1, true, "SYSTEM ONLINE (Async)");
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  Serial.println("Disconnected from MQTT.");
+  // ตั้งเวลาให้ลองต่อใหม่ใน 2 วินาที (Non-blocking)
+  if (WiFi.isConnected()) {
+    xTimerStart(mqttReconnectTimer, 0);
+  }
+}
+
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
+  Serial.print("Message [");
+  Serial.print(topic);
+  Serial.print("] ");
+
+  String msg = "";
+  for (size_t i = 0; i < len; i++) {
+    msg += payload[i];
+  }
+  msg.trim(); // ตัดช่องว่าง
+  Serial.println("Payload: [" + msg + "]");
+
+  if(String(topic) == mqtt_topic_cmd){
+    // ... Logic เดิมของเจ้านาย ...
+    if(msg == "VALVE_MANUAL"){ 
+        isValveManual = true; 
+        Serial.println("SET MODE: VALVE MANUAL");
+        reportTelemetry(lightMeter.readLightLevel());
+    }
+    else if(msg == "VALVE_AUTO"){ 
+        isValveManual = false; 
+        Serial.println("SET MODE: VALVE AUTO");
+        reportTelemetry(lightMeter.readLightLevel());
+    }
+    else if(msg == "VALVE_ON"){ 
+      if(isValveManual){
+        setRelayState(RELAY_VALVE_MAIN, true); 
+        isValveMainOn = true; 
+        Serial.println("MANUAL: VALVE ON"); 
+      } else Serial.println("Err: In AUTO Mode");
+    }
+    else if(msg == "VALVE_OFF"){ 
+      if(isValveManual){
+        setRelayState(RELAY_VALVE_MAIN, false); 
+        isValveMainOn = false; 
+        Serial.println("MANUAL: VALVE OFF"); 
+      } else Serial.println("Err: In AUTO Mode");
+    }
+    else if(msg == "LIGHT_MANUAL"){ isLightManual = true; Serial.println("SET MODE: LIGHT MANUAL"); }
+    else if(msg == "LIGHT_AUTO"){ isLightManual = false; Serial.println("SET MODE: LIGHT AUTO"); }
+    else if(msg == "LIGHT_ON"){ 
+      if(isLightManual){
+        setRelayState(RELAY_LIGHT, true); 
+        isLightOn = true; 
+        Serial.println("MANUAL: LIGHT ON");
+      } else Serial.println("Err: In AUTO Mode");
+    }else if(msg == "LIGHT_OFF"){
+      if(isLightManual){ 
+        setRelayState(RELAY_LIGHT, false); 
+        isLightOn = false; 
+        Serial.println("MANUAL: LIGHT OFF"); 
+      } else Serial.println("Err: In AUTO Mode");
+    }
+  }
+
+  // Update จอทันที
+  struct tm timeinfo;
+  int h = 0, m = 0;
+  if(getLocalTime(&timeinfo, 0)){ h = timeinfo.tm_hour; m = timeinfo.tm_min; }
+  updateDisplay_Buffered(h, m);
+}
+
 
 // --------------------- คำนวณระบบ DLI & SOIL -------------------------------
 void calculate(int currentHour, int currentMin){
@@ -644,10 +771,12 @@ void setup() {
   if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)){ Serial.println(F("BH1750 Ready!")); } 
   else { Serial.print(F("Error initialising BH1750!!")); }
 
+  mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
   // ต้องบอก MQTT Client ก่อนว่าจะไปที่ Server ไหน
-  client.setServer(mqtt_broker, mqtt_port);
-  client.setCallback(callback); // และบอกว่าถ้ามีข้อความมา ให้ไปเรียกฟังก์ชัน callback
-  
+  mqttClient.setServer(mqtt_broker, mqtt_port);
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.onMessage(onMqttMessage);
 
   // Connect Network
   // ตั้งค่า Time Server ไว้รอ (มันจะ sync เองใน background เมื่อเน็ตมา)
@@ -686,8 +815,6 @@ void setup() {
 
 void loop() {
   handleNetwork();
-
-  if(client.connected()){ client.loop(); }
 
   // Check ว่า SQW ปลุกมาหรือไม่? (ทำงานทุก 1 นาที)
   if (alarmTriggered) {
